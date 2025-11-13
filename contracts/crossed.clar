@@ -20,14 +20,17 @@
 
 ;; Constants for batch processing
 (define-constant MAX-BATCH-SIZE u50)
+(define-constant EXPECTED-SIGNATURE-LEN u65)
 
 ;; Initialize nonce for a new user (optional - can be called explicitly)
 (define-public (initialize-nonce (user principal))
-  (match (map-get? nonces user)
-    current ERR-ALREADY-INITIALIZED
-    (begin
-      (map-set nonces user u0)
-      (ok true))))
+  (begin
+    (asserts! (is-eq tx-sender user) ERR-UNAUTHORIZED)
+    (match (map-get? nonces user)
+      current ERR-ALREADY-INITIALIZED
+      (begin
+        (map-set nonces tx-sender u0)
+        (ok true)))))
 
 ;; Helper function to create message hash for signature verification
 (define-private (create-message-hash (signer principal) (nonce uint) (call-data (buff 128)))
@@ -36,6 +39,27 @@
     (nonce-buff (unwrap-panic (to-consensus-buff? nonce)))
   )
     (keccak256 (concat (concat signer-buff nonce-buff) call-data))))
+
+;; Helper to derive a principal from a recovered secp256k1 public key
+(define-private (pubkey->principal (pubkey (buff 33)))
+  (principal-of? (hash160 pubkey)))
+
+;; Helper to ensure the recovered public key matches the expected signer
+(define-private (assert-valid-signer (signer principal) (pubkey (buff 33)))
+  (match (pubkey->principal pubkey)
+    derived-principal
+      (if (is-eq derived-principal signer)
+        (ok derived-principal)
+        ERR-INVALID-SIGNATURE)
+    error-code
+      ERR-PUBKEY-DERIVATION-FAILED))
+
+(define-private (transaction-shape-valid? (transaction { signer: principal, nonce: uint, call-data: (buff 128), signature: (buff 65) }))
+  (let (
+    (call-data (get call-data transaction))
+    (signature (get signature transaction))
+  )
+    (and (> (len call-data) u0) (is-eq (len signature) EXPECTED-SIGNATURE-LEN))))
 
 ;; ENHANCED: Main relay function with proper signature verification
 (define-public (relay-call (signer principal) (nonce uint) (call-data (buff 128)) (sig (buff 65)))
@@ -52,16 +76,22 @@
         (begin
           ;; Verify that signature recovery worked
           (asserts! (> (len recovered-pubkey) u0) ERR-INVALID-SIGNATURE)
-          ;; Update nonce after successful verification
-          (map-set nonces signer (+ nonce u1))
-          (ok true))
+          (match (assert-valid-signer signer recovered-pubkey)
+            authorized-signer
+              (begin
+                ;; Update nonce after successful verification
+                (map-set nonces authorized-signer (+ nonce u1))
+                (ok true))
+            error-code
+              (err error-code)))
       error-code
         ;; Handle signature recovery failure
         ERR-INVALID-SIGNATURE)))
 
-;; NEW: Simplified batch relay function for processing multiple transactions
-(define-public (relay-batch-calls 
-  (transactions (list 50 { signer: principal, nonce: uint, call-data: (buff 128), signature: (buff 65) })))
+;; NEW: Shared batch execution helper
+(define-private (execute-batch 
+  (transactions (list 50 { signer: principal, nonce: uint, call-data: (buff 128), signature: (buff 65) }))
+  (require-full-success bool))
   (let (
     (batch-size (len transactions))
     (batch-id (+ (var-get batch-counter) u1))
@@ -74,12 +104,35 @@
       (results (map process-single-batch-transaction transactions))
       (success-count (count-successful-transactions results))
     )
+      (asserts! (or (not require-full-success) (is-eq success-count batch-size)) ERR-PARTIAL-BATCH-FAILURE)
       ;; Store batch results for tracking
       (map-set batch-results batch-id results)
       (var-set batch-counter batch-id)
       
       ;; Return success information
       (ok { batch-id: batch-id, successful: success-count, total: batch-size }))))
+
+;; NEW: Simplified batch relay function for processing multiple transactions
+(define-public (relay-batch-calls 
+  (transactions (list 50 { signer: principal, nonce: uint, call-data: (buff 128), signature: (buff 65) })))
+  (let (
+    (validation-flags (map transaction-shape-valid? transactions))
+    (total (len transactions))
+    (valid-count (fold + (map bool-to-uint validation-flags) u0))
+  )
+    (asserts! (is-eq valid-count total) ERR-INVALID-CALL-DATA)
+    (execute-batch transactions false)))
+
+;; NEW: Batch relay that reverts unless every transaction succeeds
+(define-public (relay-batch-calls-strict 
+  (transactions (list 50 { signer: principal, nonce: uint, call-data: (buff 128), signature: (buff 65) })))
+  (let (
+    (validation-flags (map transaction-shape-valid? transactions))
+    (total (len transactions))
+    (valid-count (fold + (map bool-to-uint validation-flags) u0))
+  )
+    (asserts! (is-eq valid-count total) ERR-INVALID-CALL-DATA)
+    (execute-batch transactions true)))
 
 ;; Helper function to process a single transaction in batch
 (define-private (process-single-batch-transaction 
@@ -98,10 +151,14 @@
       (match (secp256k1-recover? message-hash signature)
         recovered-pubkey
           (if (> (len recovered-pubkey) u0)
-            (begin
-              ;; Update nonce on success
-              (map-set nonces signer (+ nonce u1))
-              true)
+            (match (assert-valid-signer signer recovered-pubkey)
+              authorized-signer
+                (begin
+                  ;; Update nonce on success
+                  (map-set nonces authorized-signer (+ nonce u1))
+                  true)
+              error-code
+                false)
             false)
         error-code
           false)
@@ -121,40 +178,17 @@
   (signer2 principal) (nonce2 uint) (call-data2 (buff 128)) (sig2 (buff 65))
   (signer3 principal) (nonce3 uint) (call-data3 (buff 128)) (sig3 (buff 65)))
   (let (
-    (batch-id (+ (var-get batch-counter) u1))
-    (result1 (process-single-transaction signer1 nonce1 call-data1 sig1))
-    (result2 (process-single-transaction signer2 nonce2 call-data2 sig2))
-    (result3 (process-single-transaction signer3 nonce3 call-data3 sig3))
-    (results (list result1 result2 result3))
-    (success-count (count-successful-transactions results))
-  )
-    ;; Store batch results
-    (map-set batch-results batch-id results)
-    (var-set batch-counter batch-id)
-    
-    ;; Return success information
-    (ok { batch-id: batch-id, successful: success-count, total: u3 })))
-
-;; Helper function to process a single transaction (returns bool)
-(define-private (process-single-transaction (signer principal) (nonce uint) (call-data (buff 128)) (signature (buff 65)))
-  (let (
-    (expected (default-to u0 (map-get? nonces signer)))
-    (message-hash (create-message-hash signer nonce call-data))
-  )
-    ;; Validate nonce and call data
-    (if (and (is-eq expected nonce) (> (len call-data) u0))
-      ;; FIXED: Correct match syntax for result type
-      (match (secp256k1-recover? message-hash signature)
-        recovered-pubkey
-          (if (> (len recovered-pubkey) u0)
-            (begin
-              ;; Update nonce on success
-              (map-set nonces signer (+ nonce u1))
-              true)
-            false)
-        error-code
-          false)
-      false)))
+    (transactions (list
+      { signer: signer1, nonce: nonce1, call-data: call-data1, signature: sig1 }
+      { signer: signer2, nonce: nonce2, call-data: call-data2, signature: sig2 }
+      { signer: signer3, nonce: nonce3, call-data: call-data3, signature: sig3 })))
+    (let (
+      (validation-flags (map transaction-shape-valid? transactions))
+      (total (len transactions))
+      (valid-count (fold + (map bool-to-uint validation-flags) u0))
+    )
+      (asserts! (is-eq valid-count total) ERR-INVALID-CALL-DATA)
+      (execute-batch transactions false))))
 
 ;; NEW: Gas-optimized single relay call
 (define-public (relay-call-optimized (signer principal) (nonce uint) (call-data (buff 128)) (sig (buff 65)))
@@ -171,9 +205,14 @@
       recovered-pubkey
         (begin
           (asserts! (> (len recovered-pubkey) u0) ERR-INVALID-SIGNATURE)
-          ;; Atomic nonce update
-          (map-set nonces signer (+ nonce u1))
-          (ok true))
+          (match (assert-valid-signer signer recovered-pubkey)
+            authorized-signer
+              (begin
+                ;; Atomic nonce update
+                (map-set nonces authorized-signer (+ nonce u1))
+                (ok true))
+            error-code
+              (err error-code)))
       error-code
         ERR-INVALID-SIGNATURE)))
 
